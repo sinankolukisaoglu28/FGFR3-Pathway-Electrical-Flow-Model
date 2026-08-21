@@ -1,0 +1,845 @@
+# ============================================================
+# FGFR3 Full Signaling Cascade Model — Revised & Extended
+#
+# Pathways:
+#   1. Receptor Activation (R → LR → Dimer → Cbl endocytosis)
+#   2. MAPK/ERK Cascade (FRS2 → GRB2 → SOS1 → RAS → RAF → MEK → ERK)
+#      + SHP2 positive feedback amplification
+#   3. PLCγ/IP3/Ca²⁺ Pathway (Li-Rinzel IP3R — corrected)
+#   4. PI3K/AKT Pathway (GAB1 → PI3K → PIP3 → AKT)
+#      + Competitive GRB2 pool (SOS1 vs GAB1)
+#   5. Sprouty Negative Feedback
+#   6. JAK-STAT Module (STAT1, STAT3, STAT5 — newly added)
+#      + SOCS negative feedback
+#
+# Corrections (per review document):
+#   - GRB2-SOS1-RAS mechanism: pFRS2 → GRB2 → SOS1 → RAS
+#   - Competitive GRB2 pool: SOS1 (MAPK) vs GAB1 (PI3K)
+#   - SHP2 amplification: pFRS2 → SHP2p → extra GRB2 capacity
+#   - Li-Rinzel IP3R: dh/dt = a2*(IP3+d1)*(h_inf - h)  [erroneous 'h*Ca_i' removed]
+#   - ERK dual phosphorylation: two independent MM reactions
+#   - Realistic concentrations: nM-to-low-µM range
+#   - Cbl-mediated endocytosis: dynamic k_intern
+#   - JAK-STAT module: STAT1/3/5 phosphorylation, nuclear translocation, SOCS
+# ============================================================
+
+import numpy as np
+from scipy.integrate import solve_ivp
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import pandas as pd
+
+# ─── MODEL PARAMETERS ────────────────────────────────────────────────────────
+
+params = dict(
+
+    # ── Ligand & Receptor ────────────────────────────────────────────────────
+    L0          = 0.10,        # µM — basal ligand concentration
+    tau         = 100.0,       # s  — ligand pulse period
+    dt_pulse    = 20.0,        # s  — pulse width
+
+    R_total     = 0.10,        # µM — total FGFR3 (realistic: ~0.1 µM)
+    k_f         = 4.16,        # µM⁻¹s⁻¹ — FGF binding rate
+    k_r         = 0.864e-3,    # s⁻¹    — unbinding rate (fitted for Kd=0.25 nM)
+    k_dimer     = 5.0,         # µM⁻¹s⁻¹ — dimerization
+    k_undimer   = 0.10,        # s⁻¹    — reverse dimerization
+    # Cbl-mediated dynamic endocytosis
+    k_intern0   = 1.12e-4,     # s⁻¹    — basal endocytosis
+    k_cbl       = 0.5,         # s⁻¹µM⁻¹ — Cbl-dependent increase in endocytosis
+    k_cbl_on    = 1.0,         # s⁻¹ — Cbl phosphorylation rate
+    k_cbl_off   = 0.2,         # s⁻¹ — Cbl dephosphorylation rate
+    Cbl_tot     = 0.1,         # µM
+
+    # ── GRB2-SOS1-RAS (corrected mechanism) ──────────────────────────────────
+    FRS2_tot    = 1.0,         # µM — realistic (previous: 100 µM)
+    k_frs2_on   = 2.0,
+    k_frs2_off  = 0.5,
+
+    # SHP2: phosphorylated in a pFRS2-dependent manner, increases GRB2 capacity
+    SHP2_tot    = 0.5,         # µM
+    k_shp2_on   = 1.5,         # s⁻¹
+    k_shp2_off  = 0.3,         # s⁻¹
+    alpha_shp2  = 2.0,         # SHP2's GRB2 amplification coefficient
+
+    # GRB2 competitive pool (total)
+    GRB2_tot    = 0.5,         # µM
+
+    # GRB2-SOS1 → RAS activation
+    RAS_tot     = 0.2,         # µM — realistic (previous: 100 µM)
+    k_ras_on    = 3.0,         # GEF catalytic rate (GRB2-SOS1 dependent)
+    k_ras_off   = 0.2,         # GAP activity
+
+    # RAF, MEK
+    RAF_tot     = 0.3,         # µM
+    k_raf_on    = 1.0,
+    k_raf_off   = 0.1,
+
+    MEK_tot     = 1.0,         # µM — realistic
+    k_mek_on    = 0.8,
+    k_mek_off   = 0.1,
+
+    # ERK dual phosphorylation — two independent Michaelis-Menten reactions (corrected)
+    ERK_tot     = 0.5,         # µM — realistic (previous: 100 µM)
+    # ppMEK → ERK (step 1: ERK → pERK)
+    Vmax1       = 0.5,         # µM/s
+    Km1         = 0.3,         # µM — realistic (previous: 100 µM)
+    # ppMEK → pERK (step 2: pERK → ppERK)
+    Vmax2       = 0.5,         # µM/s
+    Km2         = 0.3,         # µM
+    # Phosphatase (ppERK → pERK)
+    # CALIBRATION (Round 2): once receptor synthesis (V_synth) was added, the
+    # signal no longer damps out and instead enters a sustained low-flux
+    # regime; the same phosphatase capacity could not balance this persistent
+    # flux, causing ppERK to jump to 66%. An 8-point scan (scale=1.0->5.0, then
+    # a fine scan over 2.6-2.9) found that scaling Vmax_m1/m2 by x2.8 gives
+    # ppERK SS%=26.83 (target band 20-30%, previous round's target was 26.54%).
+    # pAKT was unaffected (39.03%, since the PI3K/AKT arm is independent of the
+    # ERK phosphatase).
+    Vmax_m1     = 0.168,       # µM/s — 0.06 * 2.8 (scanned scale factor)
+    Km_m1       = 0.5,         # µM
+    # Phosphatase (pERK → ERK)
+    Vmax_m2     = 0.168,       # µM/s — 0.06 * 2.8 (same scale factor)
+    Km_m2       = 0.5,         # µM
+    DSP_tot     = 0.2,         # µM — no longer used in the ODE (folded into Vmax_m1/m2), kept for documentation purposes
+
+    # ── PHARMACOLOGICAL INHIBITORS (Experiment Panel 1) ─────────────────────
+    # I_MEK  : fractional block of MEK kinase catalytic activity (0=none, 1=full block)
+    #          Mechanistic assumption: allosteric (non-ATP-competitive) MEK
+    #          inhibitors such as Trametinib do NOT block RAF->pMEK
+    #          phosphorylation; they only block pMEK's catalytic capacity to
+    #          phosphorylate ERK. Hence the inhibition is applied not to ppMEK
+    #          production but to the "active MEK fraction" term inside v1/v2
+    #          (the ERK phosphorylation rates).
+    # I_PI3K : fractional block of PI3K lipid-kinase catalytic activity.
+    #          Mechanistic assumption: PI3K inhibitors such as
+    #          Alpelisib/BKM120 do NOT block GAB1 binding/pPI3K formation;
+    #          they only block pPI3K's catalytic rate of converting PIP2 to
+    #          PIP3 (in the dPIP3 production term).
+    I_MEK       = 0.0,         # 0-1, default: no inhibition
+    I_PI3K      = 0.0,         # 0-1, default: no inhibition
+
+    # ── ERK-MEDIATED CROSSTALK — Mechanistic Basis of Bypass Resistance ──────
+    # (1) ppERK → GAB1 INHIBITORY PHOSPHORYLATION  [STRONG EVIDENCE]
+    #     Literature: ERK phosphorylates inhibitory serine/threonine sites on
+    #     GAB1, reducing GAB1's capacity to bind p85/PI3K (Yu et al. 2002 J
+    #     Biol Chem; Lehr et al. 2004 J Cell Biol). This is the mechanistic
+    #     basis of PI3K/AKT "reactivation" (bypass) under MEK/ERK inhibitors,
+    #     and has also been observed clinically in trametinib resistance in
+    #     melanoma/colorectal cancer. Added in the SAME mathematical form as
+    #     the Sprouty→RAS architecture:
+    #     inhib_gab1 = 1/(1 + ppERK/K_inhibit_gab1).
+    K_inhibit_gab1 = 0.10,     # µM — EC50 of ppERK inhibiting GAB1
+
+    # (2) ppERK → SOCS INDUCTION (secondary contribution, in addition to STAT3)  [MODERATE/WEAK EVIDENCE]
+    #     Literature: in some RTK systems, the MAPK pathway has been reported
+    #     to contribute to SOCS3 induction INDEPENDENTLY of STAT3 (e.g.
+    #     Sengupta et al. 2007; Cacalano 2016 review). Since direct evidence
+    #     for FGFR3-driven urothelial carcinoma is LIMITED, this term was
+    #     added with a SMALL weight (w_ERK_SOCS) relative to the main
+    #     STAT3-derived term — explicitly flagged in the model as
+    #     secondary/speculative. Setting w_ERK_SOCS = 0 fully disables this
+    #     term (for sensitivity analysis).
+    w_ERK_SOCS  = 0.25,        # weight 0-1; relative evidence strength of the STAT3 term = 1.0
+    K_SOCS_ERK  = 0.1,         # µM — EC50 of ppERK-driven SOCS induction (same scale as K_SOCS_EC50)
+
+    # NOTE: for the PLCγ/IP3/Ca²⁺/DAG/PKC module, NO well-documented
+    # literature feedback mechanism dependent on RAS/RAF/MEK/ERK or PI3K/AKT
+    # state was FOUND (PLCγ is activated directly, receptor-proximally, by
+    # FGFR; the known inhibitory crosstalks mostly run in the OPPOSITE
+    # direction — PKC phosphorylating RAF [PLCγ→MAPK] — not the reverse).
+    # For this reason the PLCγ arm was DELIBERATELY left isolated from
+    # MEK/PI3K inhibition; it can be added if a source showing otherwise is
+    # provided.
+
+    # ── PLCγ / IP3 / Ca²⁺ Pathway ─────────────────────────────────────────────
+    PLCg_tot    = 0.3,         # µM
+    k_plcg_on   = 1.2,
+    k_plcg_off  = 0.3,
+
+    PIP2_tot    = 10.0,        # µM
+    k_PLC_cat   = 3.0,
+    Km_PIP2     = 5.0,         # µM — realistic
+
+    k_deg_IP3   = 0.5,
+
+    # Li-Rinzel IP3R parameters (standard literature values)
+    d1          = 0.13,        # µM
+    d2          = 1.049,       # µM
+    d3          = 0.9434,      # µM
+    d5          = 0.08234,     # µM
+    a2          = 0.04,        # µM⁻¹s⁻¹
+
+    # Ca²⁺ flux parameters
+    k_flux      = 10.0,
+    Ca_ER_basal = 100.0,       # µM — ER Ca²⁺ (realistic ~100-500 µM luminal)
+    V_SERCA     = 0.9,
+    K_SERCA     = 0.1,
+    J_leak_ER   = 0.05,
+    V_PMCA      = 0.25,
+    K_PMCA      = 0.15,
+
+    # DAG & PKC
+    k_dag_prod  = 1.0,
+    k_dag_deg   = 0.3,
+    PKC_tot     = 0.1,         # µM — realistic (previous: 30 µM)
+    k_PKC_on    = 0.8,
+    k_PKC_off   = 0.2,
+    K_PKC_Ca    = 0.5,
+    K_PKC_DAG   = 1.0,         # µM — realistic (previous: 5 µM)
+
+    # ── PI3K / AKT Pathway ────────────────────────────────────────────────────
+    GAB1_tot    = 0.3,         # µM
+    k_gab1_on   = 0.8,
+    k_gab1_off  = 0.15,
+
+    PI3K_tot    = 0.2,         # µM
+    k_pi3k_on   = 1.0,
+    k_pi3k_off  = 0.2,
+
+    k_pip3_prod = 0.5,
+    k_pip3_deg  = 0.1,
+
+    AKT_tot     = 0.5,         # µM — realistic (previous: 80 µM)
+    k_akt_on    = 1.2,
+    # CALIBRATION (Rule 2): k_akt_off 0.25→1.8 s⁻¹. PTEN-like phosphatase
+    # suppression was strengthened; via scanning (0.25→2.5 s⁻¹) the t=1400-
+    # 1500s average pAKT/AKT_tot ratio was brought from 80.5% down to 36.4%
+    # (target band: 30-40%, WT cell). Since ppERK was already in the target
+    # band at 27.6%, the MAPK side was LEFT UNTOUCHED.
+    k_akt_off   = 1.8,
+    K_AKT_PIP3  = 0.1,         # µM — realistic (previous: 5 µM)
+
+    # ── Sprouty Negative Feedback (Rule 3: STRUCTURAL REVISION) ──────────────
+    # OLD: dSpry = V_Spry*Hill(ppERK) - k_deg_Spry*Spry  (implicit "mRNA
+    #        synthesis" logic, slow with k_deg_Spry=0.02 s⁻¹, a production/
+    #        decay balance with a ~50s time constant)
+    # NEW: a pre-existing, INACTIVE cytosolic Sprouty pool (Spry_tot) is
+    #        phosphorylated directly/rapidly by ppERK into active pSpry —
+    #        a biochemical cascade that engages within seconds without
+    #        waiting for transcription (same kinetic architecture as the
+    #        RAF/MEK module: k_on*Kinase*(Tot-X)-k_off*X).
+    Spry_tot    = 0.3,         # µM — cytosolic inactive Sprouty pool (per user specification)
+    k_on_spry   = 1.5,         # µM⁻¹s⁻¹ — rate at which ppERK phosphorylates Sprouty
+    k_off_spry  = 0.15,        # s⁻¹ — pSpry dephosphorylation (τ≈6.7s, fast turn-off)
+    # CALIBRATION: since Spry_tot was capped at 0.3 µM (the old model could
+    # reach up to ~0.8 µM unconstrained), K_inhibit was reduced from 0.05 to
+    # 0.01 to preserve the same suppressive strength (scan: 0.05→0.006 µM;
+    # the point closest to the target ppERK SS% band of 20-30% was at 0.01).
+    K_inhibit   = 0.01,        # µM — Sprouty's inhibition of RAS (EC50)
+
+    # ── JAK-STAT Module (new) ─────────────────────────────────────────────────
+    STAT1_tot   = 0.5,         # µM
+    k_stat1_on  = 2.0,         # s⁻¹ — FGFR3 kinase → STAT1 phosphorylation
+    k_stat1_off = 0.3,         # s⁻¹
+
+    STAT3_tot   = 0.5,         # µM
+    k_stat3_on  = 2.5,
+    k_stat3_off = 0.3,
+
+    STAT5_tot   = 0.3,         # µM
+    k_stat5_on  = 1.8,
+    k_stat5_off = 0.4,
+
+    # Nuclear translocation (phospho-STAT dimer)
+    k_import    = 0.1,         # s⁻¹ — nuclear import
+    k_export    = 0.05,        # s⁻¹ — nuclear export
+
+    # SOCS (Suppressor of Cytokine Signaling) — negative feedback
+    V_SOCS      = 0.02,        # µM/s
+    K_SOCS_EC50 = 0.1,         # µM — induction by pSTAT3
+    k_deg_SOCS  = 0.01,        # s⁻¹
+    k_SOCS_inh  = 5.0,         # SOCS's inhibition of STAT activation
+
+)
+
+# ─── LIGAND FUNCTION ─────────────────────────────────────────────────────────
+def ligand(t, p):
+    t_local = t % p['tau']
+    rise = 1.0 / (1.0 + np.exp(-2.0 * (t_local - 2.0)))
+    fall = 1.0 / (1.0 + np.exp( 2.0 * (t_local - p['dt_pulse'])))
+    return p['L0'] * rise * fall
+
+# ─── ODE SYSTEM ──────────────────────────────────────────────────────────────
+# State vector Y[i]:
+#  0:  R          — free FGFR3
+#  1:  LR         — ligand-receptor complex
+#  2:  D          — active dimer
+#  3:  pCbl       — phosphorylated Cbl (new)
+#  4:  pFRS2      — phosphorylated FRS2
+#  5:  SHP2p      — phosphorylated SHP2 (new)
+#  6:  RAS_GTP    — active RAS
+#  7:  pRAF       — active RAF
+#  8:  ppMEK      — active MEK
+#  9:  ERK        — inactive ERK
+# 10:  pERK       — mono-phospho ERK
+# 11:  ppERK      — dual-phospho ERK
+# 12:  PLCg_act   — active PLCγ
+# 13:  IP3
+# 14:  Ca_i       — cytosolic Ca²⁺
+# 15:  h          — IP3R inactivation gate (Li-Rinzel, corrected)
+# 16:  DAG
+# 17:  pPKC       — active PKC
+# 18:  pGAB1
+# 19:  pPI3K
+# 20:  PIP3
+# 21:  pAKT
+# 22:  Spry       — Sprouty
+# 23:  STAT1p     — phospho-STAT1 (new)
+# 24:  STAT3p     — phospho-STAT3 (new)
+# 25:  STAT5p     — phospho-STAT5 (new)
+# 26:  STATnuc    — nuclear phospho-STAT (new, representative)
+# 27:  SOCS       — SOCS protein (new)
+
+NEQ = 28
+
+def ode_system(t, Y, p):
+    R       = max(0.0, Y[0])
+    LR      = max(0.0, Y[1])
+    D       = max(0.0, Y[2])
+    pCbl    = max(0.0, Y[3])
+    pFRS2   = max(0.0, Y[4])
+    SHP2p   = max(0.0, Y[5])
+    RAS_GTP = max(0.0, Y[6])
+    pRAF    = max(0.0, Y[7])
+    ppMEK   = max(0.0, Y[8])
+    ERK     = max(0.0, Y[9])
+    pERK    = max(0.0, Y[10])
+    ppERK   = max(0.0, Y[11])
+    PLCg_a  = max(0.0, Y[12])
+    IP3     = max(0.0, Y[13])
+    Ca_i    = max(1e-6, Y[14])
+    h       = min(1.0, max(0.0, Y[15]))
+    DAG     = max(0.0, Y[16])
+    pPKC    = max(0.0, Y[17])
+    pGAB1   = max(0.0, Y[18])
+    pPI3K   = max(0.0, Y[19])
+    PIP3    = max(0.0, Y[20])
+    pAKT    = max(0.0, Y[21])
+    Spry    = max(0.0, Y[22])
+    STAT1p  = max(0.0, Y[23])
+    STAT3p  = max(0.0, Y[24])
+    STAT5p  = max(0.0, Y[25])
+    STATnuc = max(0.0, Y[26])
+    SOCS    = max(0.0, Y[27])
+
+    L_t = ligand(t, p)
+
+    # Dimer fraction — downstream activation signal
+    D_frac = D / (p['R_total'] / 2.0 + 1e-9)
+    D_frac = min(1.0, D_frac)
+
+    # ─── 1. Cbl-Mediated Dynamic Endocytosis ─────────────────────────────────
+    dpCbl   = p['k_cbl_on'] * D_frac * (p['Cbl_tot'] - pCbl) - p['k_cbl_off'] * pCbl
+    k_intern_eff = p['k_intern0'] + p['k_cbl'] * pCbl
+
+    J_bind   = p['k_f']     * L_t * R
+    J_unbind = p['k_r']     * LR
+    J_dimer  = p['k_dimer'] * LR * LR
+    J_undim  = p['k_undimer'] * D
+    J_intern = k_intern_eff * D
+
+    # Basal receptor synthesis/turnover (V_synth = k_intern0 * R_total):
+    # derived from thermodynamic balance so that, in the ligand-free resting
+    # state, degradation = production; NO new/invented parameter is used —
+    # the existing k_intern0 and R_total are reused. The free receptor also
+    # decays at its own basal rate.
+    V_synth = p['k_intern0'] * p['R_total']
+    dR   = V_synth - p['k_intern0'] * R - J_bind + J_unbind
+    dLR  =  J_bind - J_unbind - 2*J_dimer + 2*J_undim
+    dD   =  J_dimer - J_undim - J_intern
+
+    # ─── 2. FRS2 → SHP2 Amplification ────────────────────────────────────────
+    dpFRS2 = p['k_frs2_on'] * D_frac * (p['FRS2_tot'] - pFRS2) - p['k_frs2_off'] * pFRS2
+
+    # SHP2: pFRS2-dependent phosphorylation → increases GRB2 capacity
+    dSHP2p = p['k_shp2_on'] * pFRS2 / (p['FRS2_tot'] + 1e-9) * (p['SHP2_tot'] - SHP2p) \
+             - p['k_shp2_off'] * SHP2p
+
+    # Effective GRB2 binding capacity (SHP2 amplification)
+    GRB2_eff = p['GRB2_tot'] * (1.0 + p['alpha_shp2'] * SHP2p / (p['SHP2_tot'] + 1e-9))
+
+    # Competitive GRB2 distribution: proportional to pFRS2, split between SOS1 and GAB1
+    # GRB2_SOS1: routed to the MAPK arm; GRB2_GAB1: routed to the PI3K arm
+    # Simplified: total pFRS2-bound GRB2 = GRB2_eff * pFRS2/FRS2_tot
+    GRB2_bound = GRB2_eff * (pFRS2 / (p['FRS2_tot'] + 1e-9))
+
+    # GRB2-SOS1: RAS activation (GEF mechanism)
+    GRB2_SOS1 = GRB2_bound * 0.6   # 60% to SOS1, 40% to GAB1
+    GRB2_GAB1 = GRB2_bound * 0.4
+
+    # Sprouty inhibition (at the RAS step)
+    inhib = 1.0 / (1.0 + Spry / (p['K_inhibit'] + 1e-9))
+
+    dRAS_GTP = p['k_ras_on'] * (GRB2_SOS1 / (p['GRB2_tot'] + 1e-9)) * inhib \
+               * (p['RAS_tot'] - RAS_GTP) - p['k_ras_off'] * RAS_GTP
+
+    dpRAF = p['k_raf_on']  * RAS_GTP * (p['RAF_tot'] - pRAF) - p['k_raf_off'] * pRAF
+    dppMEK= p['k_mek_on']  * pRAF * (p['MEK_tot'] - ppMEK)  - p['k_mek_off'] * ppMEK
+
+    # ERK dual phosphorylation — two INDEPENDENT Michaelis-Menten reactions
+    # UNIT CORRECTION: the Vmax parameters are no longer multiplied by the raw
+    # enzyme concentration, but by the dimensionless "activity fraction"
+    # (ppMEK/MEK_tot). This way Vmax1/Vmax2 truly have units of µM/s (the peak
+    # rate reached when MEK is fully active), consistent with the
+    # "fraction-based" convention used elsewhere in the model (D_frac,
+    # GRB2_SOS1/GRB2_tot, etc.). This change also makes the ppERK output no
+    # longer dependent on the raw numerical size of MEK_tot (which is
+    # otherwise just a pool size, not a physical unit).
+    MEK_frac = ppMEK / (p['MEK_tot'] + 1e-9)
+    # Pharmacological MEK inhibition (e.g. Trametinib): blocks catalytic
+    # output, does NOT affect RAF->pMEK phosphorylation (dppMEK above).
+    MEK_active_frac = MEK_frac * (1.0 - p.get('I_MEK', 0.0))
+    # Step 1: ppMEK → ERK + pERK (independent)
+    v1  = p['Vmax1'] * MEK_active_frac * ERK  / (p['Km1'] + ERK  + 1e-9)
+    # Step 2: ppMEK → pERK + ppERK (independent, NO substrate competition)
+    v2  = p['Vmax2'] * MEK_active_frac * pERK / (p['Km2'] + pERK + 1e-9)
+    # Phosphatase: ppERK → pERK (DSP phosphatase; DSP_tot is now folded into Vmax_m1)
+    vm1 = p['Vmax_m1'] * ppERK / (p['Km_m1'] + ppERK + 1e-9)
+    # Phosphatase: pERK → ERK
+    vm2 = p['Vmax_m2'] * pERK  / (p['Km_m2'] + pERK  + 1e-9)
+
+    dERK   = -v1 + vm2
+    dpERK  =  v1 - v2 + vm1 - vm2
+    dppERK =  v2 - vm1
+
+    # ─── 3. PLCγ / IP3 / Ca²⁺ — Corrected Li-Rinzel ──────────────────────────
+    dpLCg = p['k_plcg_on'] * D_frac * (p['PLCg_tot'] - PLCg_a) - p['k_plcg_off'] * PLCg_a
+
+    v_PLC  = p['k_PLC_cat'] * PLCg_a * p['PIP2_tot'] / (p['Km_PIP2'] + p['PIP2_tot'])
+    dIP3   = v_PLC - p['k_deg_IP3'] * IP3
+
+    # Li-Rinzel IP3R — CORRECTION: dh/dt = a2*(IP3+d1)*(h_inf - h)
+    # (previous erroneous form: a2*(h_inf - h*Ca_i))
+    m_inf  = IP3  / (IP3  + p['d1'] + 1e-9)
+    n_inf  = Ca_i / (Ca_i + p['d5'] + 1e-9)
+    # Standard Li-Rinzel h-gate (original literature form):
+    # Q2 = d2*(IP3+d1)/(IP3+d3);  dh/dt = a2*(Q2*(1-h) - Ca_i*h)
+    # The Ca_i*h term restores CICR (calcium-induced calcium inactivation)
+    # negative feedback; d1/d2/d3/a2 are all pre-existing parameters, NO new
+    # parameter was added.
+    Q2     = p['d2'] * (IP3 + p['d1']) / (IP3 + p['d3'] + 1e-9)
+    dh     = p['a2'] * (Q2 * (1.0 - h) - Ca_i * h)
+
+    Po     = min(1.0, max(0.0, (m_inf * n_inf * h) ** 3))
+
+    J_IP3R  = p['k_flux']  * Po * max(0.0, p['Ca_ER_basal'] - Ca_i)
+    J_SERCA = p['V_SERCA'] * Ca_i**2 / (p['K_SERCA']**2 + Ca_i**2 + 1e-9)
+    J_PMCA  = p['V_PMCA']  * Ca_i    / (p['K_PMCA']    + Ca_i    + 1e-9)
+
+    dCa_i  = J_IP3R + p['J_leak_ER'] - J_SERCA - J_PMCA
+
+    dDAG   = p['k_dag_prod'] * v_PLC - p['k_dag_deg'] * DAG
+
+    Ca_term  = Ca_i**2 / (p['K_PKC_Ca']**2  + Ca_i**2)
+    DAG_term = DAG     / (p['K_PKC_DAG']    + DAG + 1e-9)
+    dpPKC  = p['k_PKC_on'] * Ca_term * DAG_term * (p['PKC_tot'] - pPKC) \
+             - p['k_PKC_off'] * pPKC
+
+    # ─── 4. PI3K / AKT — uses GRB2_GAB1 ───────────────────────────────────────
+    # ERK-mediated inhibitory feedback (mechanistic basis of bypass
+    # resistance): when ppERK is high, GAB1 activation is suppressed; once
+    # MEK/ERK is blocked this suppression is lifted → GAB1/PI3K/AKT increase
+    # compensatorily (Yu et al. 2002).
+    inhib_gab1 = 1.0 / (1.0 + ppERK / (p['K_inhibit_gab1'] + 1e-9))
+    dpGAB1 = p['k_gab1_on'] * (GRB2_GAB1 / (p['GRB2_tot'] + 1e-9)) * inhib_gab1 \
+              * (p['GAB1_tot'] - pGAB1) - p['k_gab1_off'] * pGAB1
+
+    dpPI3K = p['k_pi3k_on'] * (pGAB1 / (p['GAB1_tot'] + 1e-9)) \
+              * (p['PI3K_tot'] - pPI3K) - p['k_pi3k_off'] * pPI3K
+
+    # Pharmacological PI3K inhibition (e.g. Alpelisib/BKM120): does NOT affect
+    # GAB1->pPI3K formation, only blocks pPI3K's lipid-kinase catalytic output.
+    PI3K_active = pPI3K * (1.0 - p.get('I_PI3K', 0.0))
+    dPIP3  = p['k_pip3_prod'] * PI3K_active * (p['PIP2_tot'] - PIP3) / (p['PIP2_tot'] + 1e-9) \
+             - p['k_pip3_deg'] * PIP3
+
+    AKT_term = PIP3**2 / (p['K_AKT_PIP3']**2 + PIP3**2 + 1e-9)
+    dpAKT  = p['k_akt_on'] * AKT_term * (p['AKT_tot'] - pAKT) \
+             - p['k_akt_off'] * pAKT
+
+    # ─── 5. Sprouty (Rule 3: fast phosphorylation cascade, NO mRNA delay) ────
+    # Unit check: k_on_spry[µM⁻¹s⁻¹]*ppERK[µM]*(Spry_tot-Spry)[µM] = µM/s  ✓
+    # (same bimolecular architecture as: dpRAF = k_raf_on*RAS_GTP*(RAF_tot-pRAF)-k_raf_off*pRAF)
+    dSpry  = p['k_on_spry'] * ppERK * (p['Spry_tot'] - Spry) - p['k_off_spry'] * Spry
+
+    # ─── 6. JAK-STAT Module (new) ─────────────────────────────────────────────
+    # SOCS inhibition factor (negative feedback)
+    socs_inh = 1.0 / (1.0 + SOCS * p['k_SOCS_inh'])
+
+    # STAT1 phosphorylation: directly by FGFR3 kinase (D_frac dependent)
+    dSTAT1p = p['k_stat1_on'] * D_frac * socs_inh * (p['STAT1_tot'] - STAT1p) \
+              - p['k_stat1_off'] * STAT1p
+
+    # STAT3 phosphorylation
+    dSTAT3p = p['k_stat3_on'] * D_frac * socs_inh * (p['STAT3_tot'] - STAT3p) \
+              - p['k_stat3_off'] * STAT3p
+
+    # STAT5 phosphorylation
+    dSTAT5p = p['k_stat5_on'] * D_frac * socs_inh * (p['STAT5_tot'] - STAT5p) \
+              - p['k_stat5_off'] * STAT5p
+
+    # Nuclear phospho-STAT (used as a representative total of STAT1p+STAT3p+STAT5p)
+    STAT_total_p = STAT1p + STAT3p + STAT5p
+    STAT_tot_all = p['STAT1_tot'] + p['STAT3_tot'] + p['STAT5_tot']
+    dSTATnuc = p['k_import'] * STAT_total_p - p['k_export'] * STATnuc
+
+    # SOCS: induced by pSTAT3 (target gene; main mechanism)
+    # + a secondary/speculative contribution from ppERK (weighted by
+    #   w_ERK_SOCS, weaker evidence strength than the STAT3 term — see
+    #   parameter block note)
+    dSOCS  = p['V_SOCS'] * STAT3p / (p['K_SOCS_EC50'] + STAT3p + 1e-9) \
+             + p['w_ERK_SOCS'] * p['V_SOCS'] * ppERK / (p['K_SOCS_ERK'] + ppERK + 1e-9) \
+             - p['k_deg_SOCS'] * SOCS
+
+    return [
+        dR, dLR, dD,
+        dpCbl,
+        dpFRS2, dSHP2p,
+        dRAS_GTP, dpRAF, dppMEK,
+        dERK, dpERK, dppERK,
+        dpLCg, dIP3, dCa_i, dh,
+        dDAG, dpPKC,
+        dpGAB1, dpPI3K, dPIP3, dpAKT,
+        dSpry,
+        dSTAT1p, dSTAT3p, dSTAT5p, dSTATnuc, dSOCS,
+    ]
+
+# ─── INITIAL CONDITIONS ──────────────────────────────────────────────────────
+y0 = [0.0] * NEQ
+y0[0]  = params['R_total']    # R: all receptors free
+y0[9]  = params['ERK_tot']    # ERK: all inactive
+y0[13] = 0.001                # IP3 basal (µM)
+y0[14] = 0.10                 # Ca²⁺_i basal (µM)
+y0[15] = 0.80                 # h gate initial value
+y0[16] = 0.1                  # DAG basal
+y0[20] = 0.05                 # PIP3 basal
+
+# ─── SIMULATION ──────────────────────────────────────────────────────────────
+T_END   = 1500.0
+T_START = 0.0
+DT_OUT  = 0.5
+t_eval  = np.arange(T_START, T_END + DT_OUT, DT_OUT)
+
+print("Starting simulation...")
+
+sol = solve_ivp(
+    fun    = ode_system,
+    t_span = (T_START, T_END),
+    y0     = y0,
+    method = 'LSODA',          # suitable for both stiff and non-stiff systems
+    t_eval = t_eval,
+    args   = (params,),
+    rtol   = 1e-6,
+    atol   = 1e-9,
+)
+
+if not sol.success:
+    print("ERROR:", sol.message)
+    exit(1)
+
+print(f"Simulation complete. {len(sol.t)} time points.")
+
+# ─── EXTRACT DATA ─────────────────────────────────────────────────────────────
+t       = sol.t
+R       = sol.y[0]
+LR      = sol.y[1]
+D       = sol.y[2]
+pCbl    = sol.y[3]
+pFRS2   = sol.y[4]
+SHP2p   = sol.y[5]
+RAS_GTP = sol.y[6]
+pRAF    = sol.y[7]
+ppMEK   = sol.y[8]
+ERK     = sol.y[9]
+pERK    = sol.y[10]
+ppERK   = sol.y[11]
+PLCg_a  = sol.y[12]
+IP3     = sol.y[13]
+Ca_i    = sol.y[14]
+h_gate  = sol.y[15]
+DAG     = sol.y[16]
+pPKC    = sol.y[17]
+pGAB1   = sol.y[18]
+pPI3K   = sol.y[19]
+PIP3    = sol.y[20]
+pAKT    = sol.y[21]
+Spry    = sol.y[22]
+STAT1p  = sol.y[23]
+STAT3p  = sol.y[24]
+STAT5p  = sol.y[25]
+STATnuc = sol.y[26]
+SOCS    = sol.y[27]
+
+# Derived quantities
+RAS_GDP     = params['RAS_tot'] - RAS_GTP
+ERK_total   = ERK + pERK + ppERK
+AKT_inaktif = params['AKT_tot'] - pAKT
+PKC_inaktif = params['PKC_tot'] - pPKC
+L_signal    = np.array([ligand(ti, params) for ti in t])
+
+# ─── SAVE CSV ─────────────────────────────────────────────────────────────────
+df = pd.DataFrame({
+    'Time(s)':     t,
+    'R':           R,
+    'D':           D,
+    'pCbl':        pCbl,
+    'pFRS2':       pFRS2,
+    'SHP2p':       SHP2p,
+    'RAS_GTP':     RAS_GTP,
+    'ppMEK':       ppMEK,
+    'ERK':         ERK,
+    'pERK':        pERK,
+    'ppERK':       ppERK,
+    'PLCg_active': PLCg_a,
+    'IP3':         IP3,
+    'Ca2+_i':      Ca_i,
+    'h_gate':      h_gate,
+    'DAG':         DAG,
+    'pPKC':        pPKC,
+    'pGAB1':       pGAB1,
+    'pPI3K':       pPI3K,
+    'PIP3':        PIP3,
+    'pAKT':        pAKT,
+    'Spry':        Spry,
+    'STAT1p':      STAT1p,
+    'STAT3p':      STAT3p,
+    'STAT5p':      STAT5p,
+    'STATnuc':     STATnuc,
+    'SOCS':        SOCS,
+})
+df.to_csv('fgfr3_results_revised.csv', index=False)
+print("Data saved as 'fgfr3_results_revised.csv'.")
+
+# ─── PLOT ──────────────────────────────────────────────────────────────────────
+BG    = '#0d1117'
+PANEL = '#161b22'
+GRID  = '#21262d'
+TEXT  = '#e6edf3'
+MUTED = '#8b949e'
+
+COLORS = {
+    'ligand' : '#ffffff',
+    'dimer'  : '#4fc3f7',
+    'ras'    : '#ffcc80',
+    'mek'    : '#ff7043',
+    'erk'    : '#ef5350',
+    'perk'   : '#ffb74d',
+    'erk_tot': '#90a4ae',
+    'plcg'   : '#80cbc4',
+    'ip3'    : '#4dd0e1',
+    'ca'     : '#26c6da',
+    'dag'    : '#f48fb1',
+    'pkc'    : '#f06292',
+    'gab1'   : '#a5d6a7',
+    'pi3k'   : '#66bb6a',
+    'pip3'   : '#43a047',
+    'akt'    : '#81c784',
+    'spry'   : '#ce93d8',
+    'stat1'  : '#ffd54f',
+    'stat3'  : '#ffb300',
+    'stat5'  : '#ff8f00',
+    'statnuc': '#ffe082',
+    'socs'   : '#ff6e40',
+    'shp2'   : '#64b5f6',
+    'cbl'    : '#ba68c8',
+}
+
+def style_ax(ax, title=''):
+    ax.set_facecolor(PANEL)
+    ax.tick_params(colors=TEXT, labelsize=8)
+    ax.yaxis.label.set_color(TEXT)
+    ax.xaxis.label.set_color(TEXT)
+    ax.title.set_color(TEXT)
+    for sp in ax.spines.values():
+        sp.set_edgecolor(GRID)
+    ax.grid(True, color=GRID, lw=0.5, alpha=0.8)
+    if title:
+        ax.set_title(title, fontsize=9, pad=5)
+
+def add_ligand_bg(ax):
+    ylim = ax.get_ylim()
+    if ylim[1] > ylim[0]:
+        scaled = L_signal / (params['L0'] + 1e-9) * ylim[1] * 0.12
+        ax.fill_between(t, 0, scaled, color='#ffffff', alpha=0.05, zorder=0)
+
+fig = plt.figure(figsize=(18, 28))
+fig.patch.set_facecolor(BG)
+gs = gridspec.GridSpec(8, 2, figure=fig,
+                       hspace=0.60, wspace=0.35,
+                       top=0.96, bottom=0.03, left=0.07, right=0.97)
+
+# Panel 1: Receptor + Cbl Endocytosis
+ax1 = fig.add_subplot(gs[0, 0])
+style_ax(ax1, '1A. Receptor Dynamics & Cbl Endocytosis')
+ax1.plot(t, R,    color=MUTED,           lw=1.2, ls='--', label='R (Free)')
+ax1.plot(t, LR,   color='#aed6f1',       lw=1.5, ls=':',  label='LR (Monomer)')
+ax1.plot(t, D,    color=COLORS['dimer'], lw=2.5,          label='D (Active Dimer)')
+ax1.plot(t, pCbl, color=COLORS['cbl'],   lw=1.8, ls='-.',  label='pCbl (Endocytosis)')
+ax1.set_ylabel('µM', fontsize=9)
+ax1.legend(fontsize=7, facecolor=PANEL, labelcolor=TEXT, loc='upper right')
+add_ligand_bg(ax1)
+
+# Panel 2: FRS2 + SHP2 amplification
+ax2 = fig.add_subplot(gs[0, 1])
+style_ax(ax2, '1B. FRS2 → SHP2 Amplification → GRB2-SOS1 → RAS')
+ax2.plot(t, pFRS2,   color='#64b5f6',       lw=2.0, label='pFRS2')
+ax2.plot(t, SHP2p,   color=COLORS['shp2'],  lw=1.8, ls=':', label='SHP2p (Amplifier)')
+ax2.plot(t, RAS_GTP, color=COLORS['ras'],   lw=2.5, label='RAS-GTP (GRB2-SOS1 mediated)')
+ax2.set_ylabel('µM', fontsize=9)
+ax2.legend(fontsize=7, facecolor=PANEL, labelcolor=TEXT)
+add_ligand_bg(ax2)
+
+# Panel 3: MEK-ERK (independent MM)
+ax3 = fig.add_subplot(gs[1, 0])
+style_ax(ax3, '2A. MEK-ERK — Corrected Independent Dual Phosphorylation')
+ax3.plot(t, ERK,      color=COLORS['erk_tot'], lw=1.5, ls='--', label='ERK (Inactive)')
+ax3.plot(t, pERK,     color=COLORS['perk'],    lw=1.8, ls=':',  label='pERK (Intermediate)')
+ax3.plot(t, ppERK,    color=COLORS['erk'],     lw=2.5,          label='ppERK (Fully Active)')
+ax3.plot(t, ERK_total,color='#ffffff',         lw=1.0, ls='-.', alpha=0.5, label='Total ERK')
+ax3.fill_between(t, ppERK, alpha=0.12, color=COLORS['erk'])
+ax3.set_ylabel('µM', fontsize=9)
+ax3.legend(fontsize=7, facecolor=PANEL, labelcolor=TEXT)
+add_ligand_bg(ax3)
+
+# Panel 4: PLCγ
+ax4 = fig.add_subplot(gs[1, 1])
+style_ax(ax4, '2B. PLCγ Activation (via Y760)')
+ax4.plot(t, PLCg_a, color=COLORS['plcg'], lw=2.5, label='PLCγ (Active)')
+ax4.plot(t, params['PLCg_tot'] - PLCg_a,
+            color=COLORS['plcg'], lw=1.0, ls='-.', alpha=0.4, label='PLCγ (Inactive)')
+ax4.set_ylabel('µM', fontsize=9)
+ax4.legend(fontsize=7, facecolor=PANEL, labelcolor=TEXT)
+add_ligand_bg(ax4)
+
+# Panel 5: IP3 Dynamics
+ax5 = fig.add_subplot(gs[2, 0])
+style_ax(ax5, '3A. IP3 Production')
+ax5.plot(t, IP3, color=COLORS['ip3'], lw=2.5, label='[IP3]')
+ax5.fill_between(t, IP3, alpha=0.15, color=COLORS['ip3'])
+ax5.set_ylabel('[IP3] µM', fontsize=9)
+ax5.legend(fontsize=7, facecolor=PANEL, labelcolor=TEXT)
+add_ligand_bg(ax5)
+
+# Panel 6: Ca²⁺ — Corrected Li-Rinzel
+ax6 = fig.add_subplot(gs[2, 1])
+style_ax(ax6, '3B. Ca²⁺ & IP3R h-Gate (Corrected Li-Rinzel)')
+ax6_twin = ax6.twinx()
+ax6.plot(t, Ca_i,   color=COLORS['ca'],   lw=2.5, label='[Ca²⁺]ᵢ')
+ax6_twin.plot(t, h_gate, color='#b39ddb', lw=1.5, ls=':', label='h (IP3R)')
+ax6_twin.set_ylabel('h gate', color='#b39ddb', fontsize=8)
+ax6_twin.tick_params(colors='#b39ddb')
+ax6_twin.set_facecolor(PANEL)
+ax6.set_ylabel('[Ca²⁺]ᵢ µM', fontsize=9)
+ax6.fill_between(t, Ca_i, alpha=0.15, color=COLORS['ca'])
+lines1, labels1 = ax6.get_legend_handles_labels()
+lines2, labels2 = ax6_twin.get_legend_handles_labels()
+ax6.legend(lines1+lines2, labels1+labels2, fontsize=7, facecolor=PANEL, labelcolor=TEXT)
+
+# Panel 7: DAG & PKC
+ax7 = fig.add_subplot(gs[3, 0])
+style_ax(ax7, '4A. DAG & PKC Activation')
+ax7.plot(t, DAG,         color=COLORS['dag'], lw=2.0, label='DAG')
+ax7.plot(t, pPKC,        color=COLORS['pkc'], lw=2.5, label='pPKC (Active)')
+ax7.plot(t, PKC_inaktif, color=COLORS['pkc'], lw=1.0, ls='-.', alpha=0.4, label='PKC (Inactive)')
+ax7.set_ylabel('µM', fontsize=9)
+ax7.legend(fontsize=7, facecolor=PANEL, labelcolor=TEXT)
+add_ligand_bg(ax7)
+
+# Panel 8: PI3K/AKT
+ax8 = fig.add_subplot(gs[3, 1])
+style_ax(ax8, '4B. PI3K/AKT — GRB2-GAB1 Arm')
+ax8.plot(t, pGAB1,       color=COLORS['gab1'], lw=1.8, label='pGAB1')
+ax8.plot(t, pPI3K,       color=COLORS['pi3k'], lw=2.0, label='pPI3K')
+ax8.plot(t, PIP3,        color=COLORS['pip3'], lw=2.0, label='PIP3')
+ax8.plot(t, pAKT,        color=COLORS['akt'],  lw=2.5, label='pAKT')
+ax8.fill_between(t, pAKT, alpha=0.12, color=COLORS['akt'])
+ax8.set_ylabel('µM', fontsize=9)
+ax8.legend(fontsize=7, facecolor=PANEL, labelcolor=TEXT)
+add_ligand_bg(ax8)
+
+# Panel 9: JAK-STAT — STAT1/3/5 (NEW)
+ax9 = fig.add_subplot(gs[4, 0])
+style_ax(ax9, '5A. JAK-STAT — STAT1/3/5 Phosphorylation (NEW)')
+ax9.plot(t, STAT1p, color=COLORS['stat1'], lw=2.0, label='pSTAT1')
+ax9.plot(t, STAT3p, color=COLORS['stat3'], lw=2.5, label='pSTAT3')
+ax9.plot(t, STAT5p, color=COLORS['stat5'], lw=1.8, ls='--', label='pSTAT5')
+ax9.fill_between(t, STAT3p, alpha=0.12, color=COLORS['stat3'])
+ax9.set_ylabel('µM', fontsize=9)
+ax9.legend(fontsize=7, facecolor=PANEL, labelcolor=TEXT)
+add_ligand_bg(ax9)
+
+# Panel 10: Nuclear STAT & SOCS (NEW)
+ax10 = fig.add_subplot(gs[4, 1])
+style_ax(ax10, '5B. Nuclear STAT Translocation & SOCS Feedback (NEW)')
+ax10.plot(t, STATnuc, color=COLORS['statnuc'], lw=2.5, label='STATnuc (Nuclear)')
+ax10.plot(t, SOCS,    color=COLORS['socs'],    lw=2.0, ls='-.', label='SOCS (Negative Feedback)')
+ax10.fill_between(t, STATnuc, alpha=0.12, color=COLORS['statnuc'])
+ax10.set_ylabel('µM', fontsize=9)
+ax10.legend(fontsize=7, facecolor=PANEL, labelcolor=TEXT)
+add_ligand_bg(ax10)
+
+# Panel 11: Sprouty
+ax11 = fig.add_subplot(gs[5, 0])
+style_ax(ax11, '6A. Sprouty Negative Feedback (ppERK → SPRY → RAS↓)')
+ax11.plot(t, Spry,  color=COLORS['spry'], lw=2.5, label='Sprouty')
+ax11.plot(t, ppERK, color=COLORS['erk'],  lw=1.5, ls=':', alpha=0.7, label='ppERK (reference)')
+ax11.fill_between(t, Spry, alpha=0.15, color=COLORS['spry'])
+ax11.set_ylabel('µM', fontsize=9)
+ax11.legend(fontsize=7, facecolor=PANEL, labelcolor=TEXT)
+add_ligand_bg(ax11)
+
+# Panel 12: Summary of All Outputs
+ax12 = fig.add_subplot(gs[5:7, :])
+style_ax(ax12, '7. FGFR3 Signaling Cascade Summary — All Pathway Outputs (normalized %)')
+
+def pct(arr, tot):
+    return arr / (tot + 1e-9) * 100
+
+ax12.plot(t, pct(D,      params['R_total']/2),   color=COLORS['dimer'], lw=1.5, ls=':', label='Active Dimer %')
+ax12.plot(t, pct(ppERK,  params['ERK_tot']),      color=COLORS['erk'],   lw=2.5, label='ppERK % (MAPK)')
+ax12.plot(t, pct(pAKT,   params['AKT_tot']),      color=COLORS['akt'],   lw=2.0, label='pAKT % (PI3K)')
+ax12.plot(t, pct(pPKC,   params['PKC_tot']),      color=COLORS['pkc'],   lw=2.0, label='pPKC % (PLCγ)')
+ax12.plot(t, pct(STAT3p, params['STAT3_tot']),    color=COLORS['stat3'], lw=2.0, label='pSTAT3 % (JAK-STAT)')
+ax12.plot(t, pct(STATnuc, params['STAT1_tot']+params['STAT3_tot']+params['STAT5_tot']),
+              color=COLORS['statnuc'], lw=1.5, ls='--', label='STATnuc %')
+ax12.plot(t, Ca_i / (Ca_i.max() + 1e-9) * 100,   color=COLORS['ca'],    lw=1.8, ls='--', label='Ca²⁺ (norm %)')
+ax12.plot(t, Spry / (Spry.max() + 1e-9) * 100,   color=COLORS['spry'],  lw=1.5, ls='-.', label='Sprouty (norm %)')
+ax12.set_ylabel('Activation (%)', fontsize=9)
+ax12.set_xlabel('Time (s)', fontsize=9)
+ax12.legend(fontsize=7, facecolor=PANEL, labelcolor=TEXT, ncol=4, loc='upper right')
+ax12.fill_between(t, 0, L_signal/params['L0']*10, color='#ffffff', alpha=0.05, zorder=0)
+
+fig.suptitle(
+    'FGFR3 Integrated Signaling Cascade — Revised & Extended Model\n'
+    'RAS/MAPK/ERK (GRB2-SOS1)  ·  PLCγ/IP3/Ca²⁺ (Li-Rinzel)  ·  PI3K/AKT  ·  JAK-STAT  ·  Cbl/SHP2/Sprouty\n'
+    f'Simulation: {T_END:.0f} s  |  Δt = {DT_OUT} s  |  Method: LSODA',
+    fontsize=11, fontweight='bold', color=TEXT, y=0.985
+)
+
+plt.savefig('fgfr3_revised_model.png', dpi=150, bbox_inches='tight', facecolor=BG)
+plt.close()
+print("Plot saved as 'fgfr3_revised_model.png'.")
+
+# ─── TERMINAL SUMMARY ─────────────────────────────────────────────────────────
+print("\n" + "="*65)
+print("FGFR3 REVISED MODEL SUMMARY — Steady State (t=1400-1500s average)")
+print("="*65)
+idx = t >= 1400
+for name, arr in [
+    ('ppERK (MAPK output)',     ppERK),
+    ('pAKT  (PI3K output)',     pAKT),
+    ('pPKC  (PLCγ output)',     pPKC),
+    ('Ca²⁺_i',                  Ca_i),
+    ('IP3',                     IP3),
+    ('DAG',                     DAG),
+    ('Sprouty',                 Spry),
+    ('pSTAT1 (JAK-STAT)',       STAT1p),
+    ('pSTAT3 (JAK-STAT)',       STAT3p),
+    ('pSTAT5 (JAK-STAT)',       STAT5p),
+    ('STATnuc (nuclear)',       STATnuc),
+    ('SOCS (negative feedback)',SOCS),
+    ('SHP2p (amplifier)',       SHP2p),
+    ('pCbl  (endocytosis)',     pCbl),
+]:
+    print(f"  {name:<30} = {arr[idx].mean():.6f} µM")
+print("="*65)
